@@ -85,6 +85,8 @@ def gather_rows(t: str, threshold: int, bubble_metric: str):
     df["meatballer"] = df["loc_skill"] / df["blended_Kp"]
     df["meatballer+bb"] = (df["loc_skill"] / df["blended_Kp"]) + df["blended_BBp"]
     df["meatballer+bb^2"] = df["meatballer+bb"] ** 2
+    df["BFpG"] = df["BF"] / df["G"]
+    df["K%"] = df["SO"] / df["BF"]
     df.reset_index()
 
     print(df.head())
@@ -136,11 +138,15 @@ def plot(df: pd.DataFrame, statx: str, staty: str):
 if __name__ == "__main__":
     df = gather_rows(t="p", threshold=400, bubble_metric="BF")
     # plot(df, "whiff_percent", "blended_Kp")
-    plot(df, "blended_Kp", "loc_skill")
-    plot(df, "k-bb", "xera")
-    plot(df, "xera", "meatballer+bb")
-    plot(df, "xera", "meatballer+bb^2")
-    plot(df, "whiff_percent", "meatballer")
+    plot(df, "BF", "SO")
+    plot(df, "BFpG", "blended_Kp")
+    plot(df, "BFpG", "K%")
+    plot(df, "K%", "blended_Kp")
+    # plot(df, "blended_Kp", "loc_skill")
+    # plot(df, "k-bb", "xera")
+    # plot(df, "xera", "meatballer+bb")
+    # plot(df, "xera", "meatballer+bb^2")
+    # plot(df, "whiff_percent", "meatballer")
 
     # Hypotheses
     # 1. Get away games (Game before travel or next series) are said to have more strikes thrown and more swings --> BIP

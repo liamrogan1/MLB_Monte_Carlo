@@ -1,3 +1,4 @@
+from pathlib import Path
 import re
 import numpy as np
 import pybaseball
@@ -8,6 +9,7 @@ import time
 import os
 from fuzzywuzzy import fuzz
 import unicodedata
+from datetime import datetime
 
 team_abbr = {
     "Diamondbacks": "ARI",
@@ -87,7 +89,7 @@ def clean_name(name: str) -> str:
 def match_player(
     player_name: str,
     candidates: pd.DataFrame,
-    name_col: str = "Name_aft",
+    name_col: str = "Name",
     threshold: int = 85,
 ) -> tuple[int | None, str | None, int]:
     """Fuzzy-match an odds-feed name to a row in `candidates`.
@@ -117,90 +119,43 @@ def match_player(
 
 
 def add_prop_results():
-    yesterday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y%m%d")
-    today = pd.to_datetime("today").strftime("%Y%m%d")
+    yesterday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    yday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y%m%d")
 
-    bf_path = f"./data/daily_data/bref_pitching_{yesterday}.csv"
-    aft_path = f"./data/daily_data/bref_pitching_{today}.csv"
+    odds_df = pd.read_csv(f"./data/odds/{yday}_props.csv")
 
-    import os
-    from datetime import datetime
-
-    print(f"Grading props for {yesterday}")
-    for p in (bf_path, aft_path):
-        pulled = datetime.fromtimestamp(os.path.getmtime(p))
-        print(f"  using {p} (pulled {pulled:%Y-%m-%d %H:%M})")
-
-    bf_game = pd.read_csv(bf_path)
-    aft_game = pd.read_csv(aft_path)
-
-    # Guard against duplicate mlbIDs (traded players etc.) before merging --
-    # a dup on either side multiplies rows and poisons .values[0]-style reads.
-    for label, df in (("yesterday", bf_game), ("today", aft_game)):
-        dupes = df[df["mlbID"].duplicated(keep=False)]
-        if not dupes.empty:
-            print(f"  WARNING: duplicate mlbIDs in {label} file, keeping first:")
-            print(dupes[["Name", "Tm", "mlbID"]].to_string(index=False))
-    bf_game = bf_game.drop_duplicates(subset="mlbID", keep="first")
-    aft_game = aft_game.drop_duplicates(subset="mlbID", keep="first")
-
-    merged = aft_game.merge(bf_game, on="mlbID", how="left", suffixes=("_aft", "_bf"))
-
-    for col in ("SO_bf", "BB_bf", "G_bf", "GS_bf", "Pit_bf"):
-        merged[col] = merged[col].fillna(0)
-
-    merged["SO_diff"] = merged["SO_aft"] - merged["SO_bf"]
-    merged["BB_diff"] = merged["BB_aft"] - merged["BB_bf"]
-    merged["Pit_diff"] = merged["Pit_aft"] - merged["Pit_bf"]
-    merged["Pitched"] = merged["G_aft"] - merged["G_bf"]
-
-    active_pitchers = merged[merged["Pitched"] > 0].copy()
-
-    # Freshness guard: a starter credited with a new start but <40 pitches of
-    # movement almost always means bref hadn't finished posting the game.
-    stale = active_pitchers[
-        (active_pitchers["GS_aft"] > active_pitchers["GS_bf"])
-        & (active_pitchers["Pit_diff"] < 40)
-    ]
-    if not stale.empty:
-        print("\n  WARNING: possible stale bref data (new start, tiny pitch diff):")
-        print(
-            stale[["Name_aft", "SO_diff", "BB_diff", "Pit_diff"]].to_string(index=False)
-        )
-        print("  Consider re-pulling today's file before trusting these grades.\n")
-
-    odds_df = pd.read_csv(f"./data/odds/{yesterday}_props.csv")
     if "result" not in odds_df.columns:
         odds_df["result"] = np.nan
+    elif odds_df["result"].notna().any():
+        print(f"Odds have already been graded for {yesterday}")
+        return
 
-    stat_col_by_type = {
-        "pitcher strikeouts": ("SO_diff", "Ks"),
-        "pitcher walks": ("BB_diff", "BBs"),
-    }
+    yesterday_results = pybaseball.pitching_stats_range(yesterday, yesterday)
+    yesterday_results["mlbID"] = pd.to_numeric(
+        yesterday_results["mlbID"], errors="coerce"
+    )
 
-    # Resolve each unique (type, player) once instead of per odds line,
-    # so the log shows one entry per pitcher rather than one per line.
-    for prop_type, (stat_col, unit) in stat_col_by_type.items():
+    day_totals = (
+        yesterday_results.dropna(subset=["mlbID"])
+        .groupby(["mlbID", "Name"], as_index=False)[["SO", "BB"]]
+        .sum()
+    )
+    day_totals["mlbID"] = day_totals["mlbID"].astype(int)
+
+    print(f"Grading props for {yday}")
+
+    for prop_type in ["pitcher strikeouts", "pitcher walks"]:
         subset = odds_df[odds_df["type"] == prop_type]
         if subset.empty:
             continue
+        stat_col = "SO" if prop_type == "pitcher strikeouts" else "BB"
 
         print(f"\nGrading {prop_type}:")
         for player_name in subset["player"].unique():
-            mlb_id, matched_name, score = match_player(player_name, active_pitchers)
-
+            mlb_id, matched_name, score = match_player(player_name, day_totals)
             row_idx = subset[subset["player"] == player_name].index
-            if mlb_id is not None:
-                result = active_pitchers.loc[
-                    active_pitchers["mlbID"] == mlb_id, stat_col
-                ].values[0]
-                odds_df.loc[row_idx, "result"] = result
-                flag = "" if score == 100 else f"  [fuzzy {score}]"
-                print(
-                    f"  {player_name:<25} -> {matched_name:<25} "
-                    f"{result:>3.0f} {unit}{flag}"
-                )
-            else:
+
+            if mlb_id is None:
                 odds_df.loc[row_idx, "result"] = np.nan
                 closest = (
                     f"closest: {matched_name} ({score})"
@@ -208,14 +163,31 @@ def add_prop_results():
                     else "no candidates"
                 )
                 print(f"  {player_name:<25} -> NO MATCH ({closest}) -- left as NaN")
+                continue
 
-    odds_df.to_csv(f"./data/odds/{yesterday}_props.csv", index=False)
+            result_rows = day_totals.loc[day_totals["mlbID"] == mlb_id, stat_col]
+            if result_rows.empty:
+                odds_df.loc[row_idx, "result"] = np.nan
+                print(
+                    f"  {player_name:<25} -> id {mlb_id} not in results -- left as NaN"
+                )
+                continue
+
+            result = result_rows.iloc[0]
+            odds_df.loc[row_idx, "result"] = result
+            flag = "" if score == 100 else f"  [fuzzy {score}]"
+            print(f"  {player_name:<25} -> {matched_name:<25} {result:>3.0f} {flag}")
+
+    odds_df.to_csv(f"./data/odds/{yday}_props.csv", index=False)
     graded = odds_df["result"].notna().sum()
     print(f"\nSaved: {graded}/{len(odds_df)} lines graded.")
 
 
 def save_relevant_data(year, date=pd.to_datetime("today").strftime("%Y%m%d")):
     print("Saving bref hitting data...")
+    if Path(f"./data/daily_data/bref_hitting_{date}.csv").is_file():
+        print("Stats for today already gathered")
+        return
     hitting_data = pybaseball.batting_stats_bref(year)
     hitting_data.to_csv(f"./data/daily_data/bref_hitting_{date}.csv")
 
@@ -807,3 +779,4 @@ if __name__ == "__main__":
     save_lineups()
     save_relevant_data(2026)
     add_prop_results()
+    # pybaseball.statcast("2026-08-11", "2026-08-11").to_csv("./statcast_daily.csv")

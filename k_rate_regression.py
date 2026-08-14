@@ -124,10 +124,8 @@ if __name__ == "__main__":
         pull_year(year)
 
     print(duckdb.sql("""
-        SELECT player_name, COUNT(*) AS pitches
+        SELECT COUNT(*)
         FROM 'data/training_data/statcast_*.parquet'
-        GROUP BY player_name
-        ORDER BY pitches DESC
         """))
     print(duckdb.sql("""
             SELECT player_name, COUNT(DISTINCT pitch_name) as diff_pitches
