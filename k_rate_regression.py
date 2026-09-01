@@ -94,6 +94,17 @@ def build_targets(df: pd.DataFrame) -> pd.DataFrame:
     df["velo_diff_prev"] = df["release_speed"] - df["prev_release_speed"]
     df["first_pitch"] = df["prev_pitch_type"].isna().astype(int)
 
+    df["first_pitch_whiff"] = (
+        df["first_pitch"] & df["description"].isin(WHIFF_DESCS)
+    ).astype(int)
+    df["first_pitch_swing"] = (
+        df["first_pitch"] & df["description"].isin(SWING_DESCS)
+    ).astype(int)
+    df["first_pitch_strike"] = (df["first_pitch"] & (df["type"] == "S")).astype(int)
+    df["first_pitch_called_strike"] = (
+        df["first_pitch"] & (df["description"] == "called_strike")
+    ).astype(int)
+
     return df
 
 
@@ -120,17 +131,43 @@ def pull_year(year, retries=4):
 
 
 if __name__ == "__main__":
-    for year in range(2021, 2027):
-        pull_year(year)
+    # for year in range(2021, 2027):
+    #     pull_year(year)
+    pdb = pd.read_csv("./data/player_database.csv")
+    duckdb.sql("""DESCRIBE 'data/training_data/statcast_2025.parquet'""").show(
+        max_rows=120
+    )
+    duckdb.sql(
+        """SELECT DISTINCT type FROM 'data/training_data/statcast_2025.parquet'"""
+    ).show(max_rows=120)
 
-    print(duckdb.sql("""
-        SELECT COUNT(*)
-        FROM 'data/training_data/statcast_*.parquet'
-        """))
-    print(duckdb.sql("""
-            SELECT player_name, COUNT(DISTINCT pitch_name) as diff_pitches
-            FROM 'data/training_data/statcast_*.parquet'
-            GROUP BY player_name
-            ORDER BY diff_pitches DESC
-            LIMIT 10
-            """))
+    df = pd.read_parquet(f"./data/training_data/statcast_2025.parquet")
+    df = build_targets(df)
+    first_pitches = df[df["first_pitch"] == 1]
+
+    print(
+        first_pitches[
+            [
+                "player_name",
+                "pitcher",
+                "description",
+                "events",
+                "balls",
+                "strikes",
+                "first_pitch_strike",
+            ]
+        ].head(10)
+    )
+
+    fps_leaders = first_pitches.groupby("pitcher", as_index=False)[
+        "first_pitch_strike"
+    ].mean()
+    fps_leaders = fps_leaders.rename(columns={"pitcher": "key_mlbam"})
+
+    fps_leaders = fps_leaders.merge(pdb, on="key_mlbam")
+
+    print(
+        fps_leaders[["team", "season", "rotowire_name", "first_pitch_strike"]]
+        .sort_values(by="first_pitch_strike", ascending=False)
+        .sample(10)
+    )

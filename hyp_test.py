@@ -135,6 +135,66 @@ def plot(df: pd.DataFrame, statx: str, staty: str):
     plt.show()
 
 
+def analyze_hooks():
+    logs = pd.read_csv("./data/pitcher_outing_logs.csv")
+
+    starts = logs[logs["GS"] == 1][["Outs", "pitch_count"]]
+    print("All starts")
+    print(f"Mean Outs: {starts["Outs"].mean()} SD Outs: {starts["Outs"].std()}")
+    print(
+        f"Mean PC: {starts["pitch_count"].mean()} SD PC: {starts["pitch_count"].std()}"
+    )
+
+    full_starts = logs[(logs["GS"] == 1) & (logs["IP"] > 3)][["Outs", "pitch_count"]]
+    print("Starts longer than 3 innings")
+    print(
+        f"Mean Outs: {full_starts["Outs"].mean()} SD Outs: {full_starts["Outs"].std()}"
+    )
+    print(
+        f"Mean PC: {full_starts["pitch_count"].mean()} SD PC: {full_starts["pitch_count"].std()}"
+    )
+
+    big_timers = logs.groupby("Name", as_index=False)["Outs"].mean()
+    nl = big_timers.sort_values("Outs", ascending=False).head(50)["Name"].tolist()
+    nl2 = big_timers.sort_values("Outs", ascending=False).head(25)["Name"].tolist()
+
+    big_names = logs[(logs["GS"] == 1) & (logs["Name"].isin(nl))][
+        ["Outs", "pitch_count"]
+    ]
+    big_names2 = logs[(logs["GS"] == 1) & (logs["Name"].isin(nl2))][
+        ["Outs", "pitch_count"]
+    ]
+    print("Starts from Top 20 pitchers in average outing length (Outs)")
+    print(f"Mean Outs: {big_names["Outs"].mean()} SD Outs: {big_names["Outs"].std()}")
+    print(
+        f"Mean PC: {big_names["pitch_count"].mean()} SD PC: {big_names["pitch_count"].std()}"
+    )
+
+    print()
+
+    counts = starts["Outs"].value_counts(normalize=True).sort_index()
+    cdf = counts.reindex(range(0, 28), fill_value=0).cumsum()
+    print(cdf.round(3).tolist())
+
+    outs = np.arange(28)
+    plt.step(outs, cdf, label="All Starts", color="red", where="post")
+    plt.xlabel("Outs")
+    plt.title("Starts Length CDF")
+    plt.ylabel("P(Outs <= x)")
+
+    counts = big_names["Outs"].value_counts(normalize=True).sort_index()
+    cdf = counts.reindex(range(0, 28), fill_value=0).cumsum()
+    plt.step(outs, cdf, label="Top 50", color="pink", where="post")
+
+    counts = big_names2["Outs"].value_counts(normalize=True).sort_index()
+    cdf = counts.reindex(range(0, 28), fill_value=0).cumsum()
+    plt.step(outs, cdf, label="Top 25", color="blue", where="post")
+
+    plt.legend()
+    plt.xticks(range(0, 28))
+    plt.show()
+
+
 if __name__ == "__main__":
     df = gather_rows(t="p", threshold=400, bubble_metric="BF")
     # plot(df, "whiff_percent", "blended_Kp")

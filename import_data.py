@@ -122,6 +122,10 @@ def add_prop_results():
     yesterday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     yday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y%m%d")
 
+    if not Path(f"./data/odds/{yday}_props.csv").is_file():
+        print("No props gathered yesterday")
+        return
+
     odds_df = pd.read_csv(f"./data/odds/{yday}_props.csv")
 
     if "result" not in odds_df.columns:
@@ -184,38 +188,44 @@ def add_prop_results():
 
 
 def save_relevant_data(year, date=pd.to_datetime("today").strftime("%Y%m%d")):
-    print("Saving bref hitting data...")
-    if Path(f"./data/daily_data/bref_hitting_{date}.csv").is_file():
+    if Path(f"./data/daily_data/statcast_hitter_arsenal_{date}.csv").is_file():
         print("Stats for today already gathered")
         return
+    print("Saving bullpen data...")
+    get_bullpen_data(date)
+
+    print("Saving bref hitting data...")
     hitting_data = pybaseball.batting_stats_bref(year)
     hitting_data.to_csv(f"./data/daily_data/bref_hitting_{date}.csv")
+    time.sleep(10)
 
     print("Saving statcast hitting data...")
     hitting_sc_data = pybaseball.statcast_batter_expected_stats(year, minPA=1)
     hitting_sc_data.to_csv(f"./data/daily_data/statcast_hitting_{date}.csv")
+    time.sleep(10)
 
     print("Saving bref pitching data...")
     pitching_data = pybaseball.pitching_stats_bref(year)
     pitching_data.to_csv(f"./data/daily_data/bref_pitching_{date}.csv")
-    add_pc_data(date)
+    add_pc_data()
+    time.sleep(10)
 
     print("Saving statcast pitching data...")
     pitching_sc_data = pybaseball.statcast_pitcher_expected_stats(year, minPA=1)
     pitching_sc_data.to_csv(f"./data/daily_data/statcast_pitching_{date}.csv")
+    time.sleep(10)
 
     print("Saving statcast pitcher arsenal data...")
     pitcher_arsenal_data = pybaseball.statcast_pitcher_arsenal_stats(2026, minPA=1)
     pitcher_arsenal_data.to_csv(
         f"./data/daily_data/statcast_pitcher_arsenal_{date}.csv"
     )
+    time.sleep(10)
 
     print("Saving statcast hitter arsenal data...")
     hitter_arsenal_data = pybaseball.statcast_batter_pitch_arsenal(2026, minPA=1)
     hitter_arsenal_data.to_csv(f"./data/daily_data/statcast_hitter_arsenal_{date}.csv")
-
-    print("Saving bullpen data...")
-    get_bullpen_data(date)
+    time.sleep(10)
 
     print("Blending hitter K%...")
     blend_hitter_k(date)
@@ -238,45 +248,29 @@ def save_relevant_data(year, date=pd.to_datetime("today").strftime("%Y%m%d")):
 
 
 # TODO Add in last available data instead of just using yesterday
-def add_pc_data(date):
-    yesterday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y%m%d")
-    today_data = pd.read_csv(f"./data/daily_data/bref_pitching_{date}.csv")
-    yesterday_data = pd.read_csv(f"./data/daily_data/bref_pitching_{yesterday}.csv")
+def add_pc_data(
+    date=(pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+):
+    log_path = "./data/pitcher_outing_logs.csv"
 
-    # Filter for pitchers whose game count increased from yesterday to today, indicating they pitched today
-    pitchers = today_data.merge(
-        yesterday_data, on="mlbID", how="inner", suffixes=("", "_yesterday")
-    )
+    pitching = pybaseball.pitching_stats_range(date, date)
 
-    # Account for pitchers who debuted today and thus won't have a record in yesterday's data
-    pitchers = pitchers[pitchers["G"] > pitchers["G_yesterday"]]
-    new_pitchers = today_data[~today_data["mlbID"].isin(yesterday_data["mlbID"])]
-    pitchers["is_start"] = (pitchers["GS"] - pitchers["GS_yesterday"] > 0).astype(int)
-    new_pitchers["is_start"] = (new_pitchers["GS"] > 0).astype(int)
+    if pitching.empty:
+        print(f"No data for {date}")
+        return
 
-    new_pitchers["pitch_count"] = new_pitchers["Pit"]
-    pitchers["pitch_count"] = pitchers["Pit"] - pitchers["Pit_yesterday"]
-    pitchers["date"] = yesterday
-    new_pitchers["date"] = yesterday
+    new_rows = pitching[["mlbID", "Name", "G", "GS", "IP", "BF", "Pit"]].copy()
+    new_rows["date"] = date.replace("-", "")
+    new_rows["pitch_count"] = new_rows["Pit"]
+    ip10 = (new_rows["IP"] * 10).round().astype(int)
+    new_rows["Outs"] = (ip10 // 10) * 3 + (ip10 % 10)
+    new_rows = new_rows[
+        ["mlbID", "Name", "date", "G", "GS", "IP", "Outs", "BF", "pitch_count"]
+    ]
 
-    primed_rows = pitchers[
-        ["mlbID", "date", "G", "GS", "pitch_count", "is_start"]
-    ].copy()
-    primed_rows.columns = ["mlbID", "date", "G", "GS", "pitch_count", "is_start"]
-    new_rows = new_pitchers[
-        ["mlbID", "date", "G", "GS", "pitch_count", "is_start"]
-    ].copy()
-    new_rows.columns = ["mlbID", "date", "G", "GS", "pitch_count", "is_start"]
-
-    primed_rows.to_csv(
-        f"./data/pitcher_outing_logs.csv",
-        mode="a",
-        header=not os.path.exists(f"./data/pitcher_outing_logs.csv"),
-        index=False,
-    )
-    new_rows.to_csv(
-        f"./data/pitcher_outing_logs.csv", mode="a", header=False, index=False
-    )
+    existing_log = pd.read_csv(log_path) if os.path.exists(log_path) else pd.DataFrame()
+    _flush_outing_rows([new_rows], existing_log, log_path)
+    print(f"Added {len(new_rows)} outings for {date}")
 
 
 # gets the current date's lineups and the next days if available
@@ -775,8 +769,139 @@ def save_lineups():
             lineups[1].to_csv(f"./data/lineups/{tomorrow}_lineup.csv", index=False)
 
 
+def rebuild_pitcher_outing_logs(
+    season_start="2026-03-27",
+    sleep_base=12,
+    sleep_jitter=4,
+    max_retries=3,
+):
+    import time, random
+    from pybaseball.datasources.bref import BRefSession
+
+    session = BRefSession()
+    session.session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            )
+        }
+    )
+    pybaseball.cache.enable()
+
+    log_path = "./data/pitcher_outing_logs.csv"
+
+    if os.path.exists(log_path):
+        existing_log = pd.read_csv(log_path)
+        done_dates = set(existing_log["date"].astype(str).unique())
+    else:
+        existing_log = pd.DataFrame()
+        done_dates = set()
+
+    all_dates = pd.date_range(
+        pd.to_datetime(season_start), pd.to_datetime("today") - pd.Timedelta(days=1)
+    )
+    pending = [
+        d.strftime("%Y-%m-%d")
+        for d in all_dates
+        if d.strftime("%Y%m%d") not in done_dates
+    ]
+
+    print(f"Dates already in log : {len(done_dates)}")
+    print(f"Dates to fetch       : {len(pending)}")
+    print(
+        f"Estimated time       : ~{len(pending) * (sleep_base + sleep_jitter / 2) / 60:.0f} minutes"
+    )
+    print()
+
+    all_new_rows = []
+
+    for i, date in enumerate(pending):
+        retries = 0
+        while retries <= max_retries:
+            try:
+                pitching = pybaseball.pitching_stats_range(date, date)
+
+                if pitching.empty:
+                    print(f"[{i+1}/{len(pending)}] {date} — no data (off day)")
+                    break
+
+                new_rows = pitching[
+                    ["mlbID", "Name", "G", "GS", "IP", "BF", "Pit"]
+                ].copy()
+                new_rows["date"] = date.replace("-", "")
+                new_rows["pitch_count"] = new_rows["Pit"]
+                new_rows = new_rows[
+                    ["mlbID", "Name", "date", "G", "GS", "IP", "BF", "pitch_count"]
+                ]
+
+                all_new_rows.append(new_rows)
+                print(f"[{i+1}/{len(pending)}] {date} — {len(new_rows)} outings")
+                break
+
+            except IndexError:
+                print(
+                    f"[{i+1}/{len(pending)}] {date} — no table (off day or BRef not updated)"
+                )
+                break
+
+            except Exception as e:
+                retries += 1
+                if "403" in str(e) or "Forbidden" in str(e):
+                    wait = 60 * retries
+                    print(
+                        f"[{i+1}/{len(pending)}] {date} — 403, waiting {wait}s (retry {retries}/{max_retries})"
+                    )
+                    time.sleep(wait)
+                else:
+                    print(
+                        f"[{i+1}/{len(pending)}] {date} — {e} (retry {retries}/{max_retries})"
+                    )
+                    time.sleep(10)
+
+                if retries > max_retries:
+                    print(f"  Giving up on {date}")
+                    break
+
+        if all_new_rows and (i + 1) % 10 == 0:
+            existing_log = _flush_outing_rows(all_new_rows, existing_log, log_path)
+            all_new_rows = []
+            print(f"  >> Checkpoint saved at {date}")
+
+        time.sleep(sleep_base + random.uniform(0, sleep_jitter))
+
+    if all_new_rows:
+        _flush_outing_rows(all_new_rows, existing_log, log_path)
+
+    print("\nRebuild complete.")
+
+
+def _flush_outing_rows(new_rows_list, existing_log, log_path):
+    combined = pd.concat(new_rows_list, ignore_index=True)
+
+    if not existing_log.empty:
+        new_dates = combined["date"].astype(str).unique()
+        existing_clean = existing_log[~existing_log["date"].astype(str).isin(new_dates)]
+        updated = pd.concat([existing_clean, combined], ignore_index=True)
+    else:
+        updated = combined
+
+    updated = updated.sort_values(["mlbID", "date"]).reset_index(drop=True)
+
+    # G and GS from pitching_stats_range are per-outing (1 or 0)
+    # so cumsum per player gives correct running totals
+    updated["total_G"] = updated.groupby("mlbID")["G"].cumsum()
+    updated["total_GS"] = updated.groupby("mlbID")["GS"].cumsum()
+    updated["total_Pit"] = updated.groupby("mlbID")["pitch_count"].cumsum()
+    updated["total_Outs"] = updated.groupby("mlbID")["Outs"].cumsum()
+
+    updated.to_csv(log_path, index=False)
+    return updated
+
+
 if __name__ == "__main__":
     save_lineups()
     save_relevant_data(2026)
     add_prop_results()
-    # pybaseball.statcast("2026-08-11", "2026-08-11").to_csv("./statcast_daily.csv")
+    rebuild_pitcher_outing_logs()

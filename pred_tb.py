@@ -1,3 +1,4 @@
+from collections import defaultdict
 from functools import lru_cache
 import math
 import os
@@ -130,7 +131,7 @@ def get_league_context(date: str) -> dict:
 
 
 def get_player_id(player_name: str, team: str):
-    pdb = _load_csv("./data/player_database.csv")
+    pdb = pd.read_csv("./data/player_database.csv")
     row = pdb[(pdb["rotowire_name"] == player_name) & (pdb["team"] == team)]
 
     if row.empty:
@@ -156,7 +157,7 @@ def get_hitter_hit_type_profile(hitter_id, date: str = None) -> np.ndarray:
 # NOTE k will be a variable we can extract from backtesting, however could be noisy with no weather data
 def get_component_park_factors(team: str, k: float = 0.2):
     """Returns (scalar, [1B,2B,3B,HR] multipliers). Index 100 = neutral, damped by k."""
-    pf = _load_csv("./data/park_factors.csv")
+    pf = pd.read_csv("./data/park_factors.csv")
     r = pf[pf["Team"] == team]
     scalar = 1 + k * ((r["Park Factor"].values[0] - 100) / 100)
     comp = np.array(
@@ -179,9 +180,7 @@ def draw_bip_outcome(
         s * np.array([1, 2, 3, 4])
     ).sum()  # aquire mean bases per hit by multiplying the new distribution by the corresponding bases
     T = target_xslg * park_scalar  # park level effect
-    h = max(T / mean_bph, h_min)  # P(hit|contact)
-    if h > h_max:
-        print(f"H eclipsed {h_max}")
+    h = min(max(T / mean_bph, h_min), h_max)  # P(hit|contact)
     probs = np.concatenate([[1 - h], h * s])  # [out,1B,2B,3B,HR]
     idx = rng.choice(5, p=probs)
     return int(BASES[idx]), idx == 0  # bases, is_out
@@ -197,16 +196,20 @@ def simulate_pa(r, in_pen, rng):
     pitches = int(rng.geometric(1.0 / ppab))
     u = rng.random()
     if u < xBB:
-        return dict(out=False, K=False, BB=True, bases=0, pitches=pitches)
+        return dict(out=False, K=False, BB=True, bases=0, pitches=pitches, BIP=False)
     if u < xBB + xHBP:
-        return dict(out=False, K=False, BB=False, bases=0, pitches=pitches)  # HBP≈reach
+        return dict(
+            out=False, K=False, BB=False, bases=0, pitches=pitches, BIP=False
+        )  # HBP≈reach
     if u < xBB + xHBP + xK:
-        return dict(out=True, K=True, BB=False, bases=0, pitches=pitches)
+        return dict(out=True, K=True, BB=False, bases=0, pitches=pitches, BIP=False)
     b, is_out = draw_bip_outcome(r["hit_shares"], T, r["pf_comp"], r["pf_scalar"], rng)
-    return dict(out=is_out, K=False, BB=False, bases=b, pitches=pitches)
+    return dict(out=is_out, K=False, BB=False, bases=b, pitches=pitches, BIP=True)
 
 
-def starter_hook_prob(pc, bf, leash, cap=120, steepness=0.12, tto_bump=0.10, margin=16):
+def starter_hook_prob(
+    pc, bf, outs, leash, cap=120, steepness=0.12, tto_bump=0.10, margin=16
+):
     """
     Probability the starter is pulled BEFORE the next hitter.
     Smooth (no inning quantization), centered on `leash` pitches.
@@ -217,23 +220,35 @@ def starter_hook_prob(pc, bf, leash, cap=120, steepness=0.12, tto_bump=0.10, mar
     """
     if pc >= cap:
         return 1.0
-    p = 1.0 / (1.0 + np.exp(-steepness * (pc - leash - margin)))  # 0.5 at pc == leash
-    if bf >= 18:  # 19th batter = 3rd time through
-        p = min(p + tto_bump, 1.0)
-    return p
+
+    # Existing pitch-count component
+    p_pc = 1.0 / (1.0 + np.exp(-steepness * (pc - leash - margin)))
+    if bf >= 18:
+        p_pc = min(p_pc + tto_bump, 1.0)
+
+    # Outs-based component — independent of pitch count
+    # Centered at 21 outs (7 innings): 50% pull probability per PA check
+    # At 24 outs (8 inn): ~82%, at 27 (CG): ~95% per check
+    p_outs = 1.0 / (1.0 + np.exp(-0.5 * (outs - 24)))
+
+    # Either trigger can pull the pitcher
+    return min(max(p_pc, p_outs), 1.0)
 
 
 # ---------- one game against the lineup (27 outs), boundary hook + bullpen ----------
-def simulate_start_and_game(batters, outing_target, rng, hard_cap=120):
+def simulate_start_and_game(
+    batters, outing_target, rng, hard_cap=120, margin=16, steepness=0.12
+):
     outs = 0
     b = 0
     pc = 0
     in_pen = False
-    st = dict(K=0, BB=0, BF=0, outs=0, H=0, pc=0)
+    st = dict(K=0, BB=0, BF=0, outs=0, H=0, pc=0, HR=0, BIP=1e-8)
     tb = np.zeros(9)
     kb = np.zeros(9)
     bbb = np.zeros(9)
     hrh = np.zeros(9)
+    bab = np.zeros(9)
     while outs < 27:
         inning_outs = 0
         while inning_outs < 3 and outs < 27:
@@ -247,20 +262,29 @@ def simulate_start_and_game(batters, outing_target, rng, hard_cap=120):
                 st["BB"] += res["BB"]
                 st["H"] += not res["out"] and not res["BB"] and res["bases"] > 0
                 st["outs"] += res["out"]
+                st["HR"] += 1 if res["bases"] == 4 else 0
+                st["BIP"] += res["BIP"]
             tb[b % 9] += res["bases"]
             kb[b % 9] += res["K"]
             bbb[b % 9] += res["BB"]
             hrh[b % 9] += 1 if res["bases"] == 4 else 0
+            bab[b % 9] += 1
             if res["out"]:
                 inning_outs += 1
                 outs += 1
             b += 1
-            if not in_pen and outs < 27:  # v1 hook: inning boundary only
+            if not in_pen and outs < 27:
                 if rng.random() < starter_hook_prob(
-                    pc, st["BF"], outing_target, hard_cap
+                    pc,
+                    st["BF"],
+                    outs,
+                    outing_target,
+                    hard_cap,
+                    margin=margin,
+                    steepness=steepness,
                 ):
                     in_pen = True
-    return st, tb, kb, bbb, hrh
+    return st, tb, kb, bbb, hrh, bab
 
 
 def build_batter_params(
@@ -604,20 +628,19 @@ def compare_odds_pitcher(
 
     pitcher_ks_history = np.asarray(pitcher_ks_history)
     pitcher_bb_history = np.asarray(pitcher_bb_history)
-    odds_df = pd.read_csv(f"./data/odds/{date}_props.csv")
+    odds_df = pd.read_csv(path)
     for col in ["pred_prob", "kelly", "bet_size"]:
         if col not in odds_df.columns:
             odds_df[col] = np.nan
-        odds_df[f"{col}_old"] = odds_df[col]  # Creates a snapshot
+        odds_df[f"{col}_old"] = odds_df[col]
 
-    # Keep only the most recent snapshot of each unique line (original indices preserved)
     key_cols = ["date", "home_team", "away_team", "type", "player", "side", "point"]
     if "fetched_at" in odds_df.columns:
         latest = odds_df.sort_values("fetched_at").drop_duplicates(
             subset=key_cols, keep="last"
         )
     else:
-        latest = odds_df  # old files without timestamps
+        latest = odds_df
 
     team_odds = (
         latest[latest["home_team"] == team_abbr.get(team)]
@@ -628,73 +651,56 @@ def compare_odds_pitcher(
         team_odds["type"].isin(["pitcher strikeouts", "pitcher walks"])
     ].copy()
 
-    # Use fuzzy matching to find the correct pitcher
     pitcher_odds["name_match"] = pitcher_odds["player"].apply(
         lambda x: fuzz.ratio(x, pitcher_name)
     )
-    pitcher_odds = pitcher_odds[pitcher_odds["name_match"] > 70].copy()
-
-    # Using pitcher_ks_history, calculate the probability of the pitcher going over and under each line and compare to the odds
-    # "side" is either over or under
+    pitcher_odds = pitcher_odds[pitcher_odds["name_match"] > 50].copy()
 
     for idx, row in pitcher_odds.iterrows():
         point = row["point"]
+        hist = (
+            pitcher_ks_history
+            if row["type"] == "pitcher strikeouts"
+            else pitcher_bb_history
+        )
 
-        if row["type"] == "pitcher strikeouts":
-            if row["side"] == "over":
-                prob_ks = np.mean(pitcher_ks_history > point)
-                if prob_ks <= 0 or prob_ks >= 1:
-                    continue
-                odds_df.loc[idx, "pred_prob"] = round(1 / (prob_ks), 2)
-                odds_df.loc[idx, "kelly"] = get_kelly(row["price"], prob_ks)
-                odds_df.loc[idx, "bet_size"] = 1000 * get_kelly(row["price"], prob_ks)
-                pitcher_odds.loc[idx, "pred_prob"] = round(1 / (prob_ks), 2)
-                pitcher_odds.loc[idx, "bet_size"] = 1000 * get_kelly(
-                    row["price"], prob_ks
-                )
-            elif row["side"] == "under":
-                prob_ks = np.mean(pitcher_ks_history < point)
-                if prob_ks <= 0 or prob_ks >= 1:
-                    continue
-                odds_df.loc[idx, "pred_prob"] = round(1 / prob_ks, 2)
-                odds_df.loc[idx, "kelly"] = get_kelly(row["price"], prob_ks)
-                odds_df.loc[idx, "bet_size"] = 1000 * get_kelly(row["price"], prob_ks)
-                pitcher_odds.loc[idx, "pred_prob"] = round(1 / prob_ks, 2)
-                pitcher_odds.loc[idx, "bet_size"] = 1000 * get_kelly(
-                    row["price"], prob_ks
-                )
-        if row["type"] == "pitcher walks":
-            if row["side"] == "over":
-                prob_bbs = np.mean(pitcher_bb_history > point)
-                if prob_bbs <= 0 or prob_bbs >= 1:
-                    continue
-                odds_df.loc[idx, "pred_prob"] = round(1 / (prob_bbs), 2)
-                odds_df.loc[idx, "kelly"] = get_kelly(row["price"], prob_bbs)
-                odds_df.loc[idx, "bet_size"] = 1000 * get_kelly(row["price"], prob_bbs)
-                pitcher_odds.loc[idx, "pred_prob"] = round(1 / (prob_bbs), 2)
-                pitcher_odds.loc[idx, "bet_size"] = 1000 * get_kelly(
-                    row["price"], prob_bbs
-                )
-            elif row["side"] == "under":
-                prob_bbs = np.mean(pitcher_bb_history < point)
-                if prob_bbs <= 0 or prob_bbs >= 1:
-                    continue
-                odds_df.loc[idx, "pred_prob"] = round(1 / prob_bbs, 2)
-                odds_df.loc[idx, "kelly"] = get_kelly(row["price"], prob_bbs)
-                odds_df.loc[idx, "bet_size"] = 1000 * get_kelly(row["price"], prob_bbs)
-                pitcher_odds.loc[idx, "pred_prob"] = round(1 / prob_bbs, 2)
-                pitcher_odds.loc[idx, "bet_size"] = 1000 * get_kelly(
-                    row["price"], prob_bbs
-                )
-    # Convert price and pred_prob to american odds in print statement need to divide by 1 to get probability
+        if row["side"] == "over":
+            prob = np.mean(hist > point)
+        else:
+            prob = np.mean(hist < point)
+
+        odds_df.loc[idx, "pred_prob"] = prob
+
+        if 0 < prob < 1:
+            kelly = get_kelly(row["price"], prob)
+            odds_df.loc[idx, "kelly"] = kelly
+            odds_df.loc[idx, "bet_size"] = 1000 * kelly
+        else:
+            odds_df.loc[idx, "kelly"] = 0.0
+            odds_df.loc[idx, "bet_size"] = 0.0
+
+        if odds_df.loc[idx, "bet_size"] > 0:
+            print(
+                odds_df.loc[
+                    [idx],
+                    [
+                        "player",
+                        "type",
+                        "side",
+                        "point",
+                        "price",
+                        "pred_prob",
+                        "bet_size",
+                    ],
+                ]
+            )
+
     if write:
-        odds_df.to_csv(f"./data/odds/{date}_props.csv", index=False)
+        odds_df.to_csv(path, index=False)
 
-    # Return this pitcher's touched lines with old+new side by side.
-    # No printing here — the caller assembles the slate-wide view.
     out = odds_df.loc[pitcher_odds.index].copy()
     out["pitcher"] = pitcher_name
-    return out  # so a caller can aggregate if it wants
+    return out
 
 
 # TODO
@@ -753,6 +759,7 @@ def monte_carlo_outs(
         if pitcher_arsenal is None:
             continue
 
+        # TODO Add in missing SP and doubleheader logic
         ml_prob.setdefault(batting_team, 0)
         ml_prob.setdefault(pitching_team, 0)
 
@@ -768,33 +775,41 @@ def monte_carlo_outs(
         hitter_expected_strikeouts = {}
         hitter_expected_walks = {}
         hitter_expected_hrs = {}
+        hitter_expected_abs = {}
 
         pitcher_ks_history = []
         pitcher_pc_history = []
         pitcher_bbs_history = []
         pitcher_outs_history = []
         pitcher_tbf_history = []
+        pitcher_ha_history = []
+        pitcher_hra_history = []
+        pitcher_bip_history = []
 
-        LEASH_SCALE = 1.005
+        LEASH_SCALE = 1.2
 
         # ---- v1 out-based simulation (replaces the old pitch-budget starter + bullpen loops) ----
-        for n in range(n_sims):
+        for n in tqdm(range(n_sims)):
             target = (
                 base_pc * rng.choice(outing_ratios) * LEASH_SCALE
             )  # calibrated left-skew hook
-            st, tb, kb, bbb, hrh = simulate_start_and_game(batters, target, rng)
+            st, tb, kb, bbb, hrh, bab = simulate_start_and_game(batters, target, rng)
 
             pitcher_ks_history.append(st["K"])
             pitcher_bbs_history.append(st["BB"])
             pitcher_pc_history.append(st["pc"])
             pitcher_outs_history.append(st["outs"])
             pitcher_tbf_history.append(st["BF"])
+            pitcher_ha_history.append(st["H"])
+            pitcher_hra_history.append(st["HR"])
+            pitcher_bip_history.append(st["BIP"])
 
             for j, name in enumerate(df["Player"]):
                 hitter_expected_bases.setdefault(name, []).append(tb[j])
                 hitter_expected_strikeouts.setdefault(name, []).append(kb[j])
                 hitter_expected_walks.setdefault(name, []).append(bbb[j])
                 hitter_expected_hrs.setdefault(name, []).append(hrh[j])
+                hitter_expected_abs.setdefault(name, []).append(bab[j])
 
         # Compare pitcher strikeouts and walks to current odds
         if odds:
@@ -821,18 +836,25 @@ def monte_carlo_outs(
         std_outs = np.std(pitcher_outs_history)
         mean_tbf = np.mean(pitcher_tbf_history)
         std_tbf = np.std(pitcher_tbf_history)
+        mean_ha = np.mean(pitcher_ha_history)
+        std_ha = np.std(pitcher_ha_history)
+        median_hra = np.median(pitcher_hra_history)
+
+        pit_babip = np.array(pitcher_ha_history) / np.array(pitcher_bip_history)
 
         # Print mean and median expected bases for each hitter
         cum_mean = 0
         cum_median = 0
+        print("=" * 70)
         for hitter in hitter_expected_bases:
             expected_bases_list = np.array(hitter_expected_bases[hitter])
             expected_hrs_list = np.array(hitter_expected_hrs[hitter])
             expected_strikeouts_list = np.array(hitter_expected_strikeouts[hitter])
             expected_walks_list = np.array(hitter_expected_walks[hitter])
+            expected_abs_list = np.array(hitter_expected_abs[hitter])
             mean_expected_bases = np.mean(expected_bases_list)
             median_expected_bases = np.median(expected_bases_list)
-            std_expected_bases = np.std(expected_bases_list)
+            mean_abs = np.mean(expected_abs_list)
 
             # Calculate the percent chance of going over total bases with poisson distribution
             prob_over_1_5 = np.mean(expected_bases_list > 1.5)
@@ -842,13 +864,19 @@ def monte_carlo_outs(
             prob_hitter_walk = np.mean(expected_walks_list > 0.5)
             if printing:
                 print(
-                    f"{hitter}: {mean_expected_bases:.3f} mean | [o1.5 TB {round(get_american_odds(prob_over_1_5),0)}] HR {round(get_american_odds(prob_hr),0)} || o0.5BBs {round(get_american_odds(prob_hitter_walk),0)} |  o0.5Ks {round(get_american_odds(prob_hitter_k),0)} | o1.5Ks {round(get_american_odds(prob_hitter_k2),0)}"
+                    f"{hitter}: #ABs {mean_abs:.1f} {mean_expected_bases:.3f} mean | [o1.5 TB {get_american_odds(prob_over_1_5):+.0f}] HR {get_american_odds(prob_hr):+.0f} || o0.5BBs {get_american_odds(prob_hitter_walk):+.0f} |  o0.5Ks {get_american_odds(prob_hitter_k):+.0f} | o1.5Ks {get_american_odds(prob_hitter_k2):+.0f}"
                 )
             cum_mean += mean_expected_bases
             cum_median += median_expected_bases
             if plot_b:
                 display_outcomes.plot_histo(
                     "Total Bases", expected_bases_list, hitter, pitcher_name, date
+                )
+                display_outcomes.plot_histo(
+                    "Walks", expected_walks_list, hitter, pitcher_name, date
+                )
+                display_outcomes.plot_histo(
+                    "At-Bats", expected_abs_list, hitter, pitcher_name, date
                 )
         if printing:
             print(f"Lineup Total: {cum_mean:.3f} mean, {cum_median:.3f} median")
@@ -872,17 +900,24 @@ def monte_carlo_outs(
         pitcher_prob_bbs_upper = np.mean(bbs_array > 2.5)
 
         if printing:
-            print(f"Pitcher Stats: Mean Ks = {mean_ks:.2f}, STD = {std_ks:.2f}")
+            print(f"Pitcher Stats: Ks = {mean_ks:.2f}, STD = {std_ks:.2f}")
             print(
-                f"Pitcher odds to go o{pitcher_whole_lower}: {get_american_odds(pitcher_prob_ks_lower)} [o{pitcher_whole_mid}: {get_american_odds(pitcher_prob_ks)}] o{pitcher_whole_upper}: {get_american_odds(pitcher_prob_ks_upper)}"
+                f"o{pitcher_whole_lower}: {get_american_odds(pitcher_prob_ks_lower)} [o{pitcher_whole_mid}: {get_american_odds(pitcher_prob_ks)}] o{pitcher_whole_upper}: {get_american_odds(pitcher_prob_ks_upper)}"
             )
-            print(f"Pitcher Stats: Mean BBs = {mean_bbs:.2f}, STD = {std_bbs:.2f}")
+            print(f"BBs = {mean_bbs:.2f}, STD = {std_bbs:.2f}")
             print(
-                f"Pitcher odds to go o1.5: {get_american_odds(pitcher_prob_bbs_lower)} o2.5: {get_american_odds(pitcher_prob_bbs_upper)}"
+                f"o1.5: {get_american_odds(pitcher_prob_bbs_lower)} o2.5: {get_american_odds(pitcher_prob_bbs_upper)}"
             )
-            print(f"Pitcher Stats: Mean PC = {mean_pc:.2f}, STD = {std_pc:.2f}")
-            print(f"Pitcher Stats: Mean Outs = {mean_outs:.2f}, STD = {std_outs:.2f}")
-            print(f"Pitcher Stats: Mean TBF = {mean_tbf:.2f}, STD = {std_tbf:.2f}")
+
+            print(
+                f"IP {(np.ceil(mean_outs)//3):.0f}.{np.ceil(mean_outs) % 3:.0f} | PC {mean_pc:.0f} | H {mean_ha:.0f} | HR {median_hra:.0f} | BB {mean_bbs:.0f} | K {mean_ks:.0f}"
+            )
+            print(
+                f"WHIP {((mean_ha + mean_bbs)/(mean_outs/3)):.2f} | AVG {(mean_ha/mean_tbf):.3f} | OBP {(1-(mean_outs/mean_tbf)):.3f} | BABIP {np.mean(pit_babip):.3f}"
+            )
+            print(
+                f"PC = {mean_pc:.2f}, STD = {std_pc:.2f} | HA = {mean_ha:.2f}, STD = {std_ha:.2f} | Outs = {mean_outs:.2f}, STD = {std_outs:.2f} | TBF = {mean_tbf:.2f}, STD = {std_tbf:.2f}"
+            )
             print()
 
         # Plot pitcher strikeouts histogram
@@ -897,13 +932,12 @@ def monte_carlo_outs(
                 batting_team,
                 date,
             )
+    matchup_file.to_csv(f"./data/todays_matchups.csv", index=False)
     return sim_rows
-
-    # matchup_file.to_csv(f"./data/todays_matchups.csv", index=False)
 
 
 def get_park_factor(team: str) -> float:
-    park_factors = _load_csv("./data/park_factors.csv")
+    park_factors = pd.read_csv("./data/park_factors.csv")
     team_park_factor = park_factors[park_factors["Team"] == team]
     factor = team_park_factor["Park Factor"].values[0]
     k = 0.2  # Adjust this value to control how much the park factor influences the expected bases
@@ -1067,10 +1101,10 @@ def get_pitcher_pc_distribution(
     Returns (median_pc, std_pc) using TTO-anchored floor/ceiling as guardrails
     rather than raw Q1/Q3 which can be skewed by small samples.
     """
-    pitching_log = _load_csv("./data/pitcher_outing_logs.csv")
+    pitching_log = pd.read_csv("./data/pitcher_outing_logs.csv")
 
     pitcher_log = pitching_log[pitching_log["mlbID"] == pitcher_id].sort_values("date")
-    starts = pitcher_log[pitcher_log["is_start"] == 1]
+    starts = pitcher_log[(pitcher_log["GS"] == 1) & (pitcher_log["date"] < int(date))]
 
     # TTO-based guardrails using pitcher's own P/BF if available
     p_per_bf = get_pitcher_pitches_per_ab(pitcher_id, date)
@@ -1086,7 +1120,7 @@ def get_pitcher_pc_distribution(
         sample = starts.tail(10)["pitch_count"]
     elif len(starts) > 0:
         # Pad with relief outings but clip at floor so they don't drag median down
-        relief = pitcher_log[pitcher_log["is_start"] == 0].tail(10 - len(starts))
+        relief = pitcher_log[pitcher_log["GS"] == 0].tail(10 - len(starts))
         relief_clipped = relief["pitch_count"].clip(lower=floor_pc * 0.5)
         sample = pd.concat([starts["pitch_count"], relief_clipped])
     else:
@@ -1168,7 +1202,6 @@ def get_hitter_hbp_prob(hitter_id: str, date: str = None) -> float:
     return hitter_data["HBP"].values[0] / hitter_data["PA"].values[0]
 
 
-# Total Pitches / PA X
 def get_hitter_pitches_per_ab(hitter_id: str, date: str = None) -> float:
     date = date or pd.to_datetime("today").strftime("%Y%m%d")
     bref_df = _load_csv(f"./data/daily_data/bref_hitting_{date}.csv")
@@ -1390,100 +1423,156 @@ def against_market_results(
 
 
 def calibrate_workload(
-    date, outing_ratios, league, leash_scale=0.92, n_sims=3000, seed=0, hard_cap=120
+    num_days,
+    scales=[1.2],
+    margins=[16],
+    steepness=0.12,
+    n_sims=3000,
+    seed=0,
+    hard_cap=120,
 ):
     """
-    Runs the starter sim across every scheduled starter and reports how the
-    simulated workload distribution compares to real league targets.
-    Prints a per-pitcher table plus a pooled summary, and suggests the
-    LEASH_SCALE that would center mean outs on ~15.5.
+    Sweep (leash_scale, margin) combos and report simulated workload against
+    both league targets AND each pitcher's ACTUAL pitch count that day.
+    Each combo is held fixed across all days (no mid-run adaptation) and pooled,
+    so the comparison reflects the constant, not daily noise.
     """
-    rng = np.random.default_rng(seed)
-    lineups_data = _load_csv(f"./data/lineups/{date}_lineup.csv")
-
-    rows = []  # per-pitcher summary
-    pooled_outs, pooled_bf, pooled_pc = [], [], []  # every simulated start
-
-    for i in range(0, len(lineups_data), 9):
-        lineup = lineups_data.iloc[i : i + 9]
-        df = get_lineup_dataframe(lineup, date, league)
-        pitching_team = lineup["Opponent"].values[0]
-        pitcher_name = lineup["Opposing Pitcher"].values[0]
-        pitcher_id = get_player_id(pitcher_name, pitching_team)
-        batting_team = lineup["Team"].values[0]
-        is_home = lineup["Is Home"].values[0]
-
-        if get_pitcher_arsenal(pitcher_id, date) is None:
+    # ---- build the per-day inputs ONCE (shared across all combos) ----
+    days = []
+    for diff in range(num_days + 1):
+        date = (pd.to_datetime("today") - pd.Timedelta(days=diff)).strftime("%Y%m%d")
+        if not os.path.exists(f"./data/lineups/{date}_lineup.csv"):
             continue
+        lineups_data = _load_csv(f"./data/lineups/{date}_lineup.csv")
+        outing_ratios, league = build_day_context(date)
 
-        pf_scalar, pf_comp = get_component_park_factors(
-            batting_team if is_home else pitching_team
-        )
-        batters = [
-            build_batter_params(
-                df.iloc[j],
-                get_player_id(df.iloc[j]["Player"], batting_team),
-                pitcher_id,
-                pitching_team,
-                pf_scalar,
-                pf_comp,
-                league,
-                date,
+        starters = []
+        for i in range(0, len(lineups_data), 9):
+            lineup = lineups_data.iloc[i : i + 9]
+            df = get_lineup_dataframe(lineup, date, league)
+            pitching_team = lineup["Opponent"].values[0]
+            pitcher_name = lineup["Opposing Pitcher"].values[0]
+            pitcher_id = get_player_id(pitcher_name, pitching_team)
+            batting_team = lineup["Team"].values[0]
+            is_home = lineup["Is Home"].values[0]
+            if get_pitcher_arsenal(pitcher_id, date) is None:
+                continue
+            pf_scalar, pf_comp = get_component_park_factors(
+                batting_team if is_home else pitching_team
             )
-            for j in range(9)
-        ]
-        base_pc, _ = get_pitcher_pc_distribution(pitcher_id, date)
+            batters = [
+                build_batter_params(
+                    df.iloc[j],
+                    get_player_id(df.iloc[j]["Player"], batting_team),
+                    pitcher_id,
+                    pitching_team,
+                    pf_scalar,
+                    pf_comp,
+                    league,
+                    date,
+                )
+                for j in range(9)
+            ]
+            base_pc, _ = get_pitcher_pc_distribution(pitcher_id, date)
+            actual_pc = _actual_pc_for(pitcher_id, date)  # real PC thrown that day
+            starters.append(
+                dict(
+                    name=pitcher_name,
+                    base_pc=base_pc,
+                    batters=batters,
+                    outing_ratios=outing_ratios,
+                    actual_pc=actual_pc,
+                )
+            )
+        days.append((date, starters))
 
-        o, bf, pc = [], [], []
-        for _ in range(n_sims):
-            target = base_pc * rng.choice(outing_ratios) * leash_scale
-            st, *_ = simulate_start_and_game(batters, target, rng, hard_cap)
-            o.append(st["outs"])
-            bf.append(st["BF"])
-            pc.append(st["pc"])
-        o, bf, pc = np.array(o), np.array(bf), np.array(pc)
-        pooled_outs += o.tolist()
-        pooled_bf += bf.tolist()
-        pooled_pc += pc.tolist()
+    # ---- sweep combos, each held fixed across all days ----
+    results = []
+    for margin in margins:
+        for scale in scales:
+            rng = np.random.default_rng(seed)  # same seed per combo = fair compare
+            po, pbf, ppc = [], [], []
+            sim_vs_actual = []  # (sim_pc_mean, actual_pc) per start with a real PC
+            for date, starters in days:
+                for s in starters:
+                    o, bf, pc = [], [], []
+                    for _ in range(n_sims):
+                        target = s["base_pc"] * rng.choice(s["outing_ratios"]) * scale
+                        st, *_ = simulate_start_and_game(
+                            s["batters"],
+                            target,
+                            rng,
+                            hard_cap,
+                            margin=margin,
+                            steepness=steepness,
+                        )
+                        o.append(st["outs"])
+                        bf.append(st["BF"])
+                        pc.append(st["pc"])
+                    o, bf, pc = np.array(o), np.array(bf), np.array(pc)
+                    po += o.tolist()
+                    pbf += bf.tolist()
+                    ppc += pc.tolist()
+                    if s["actual_pc"] is not None and not np.isnan(s["actual_pc"]):
+                        sim_vs_actual.append((pc.mean(), s["actual_pc"]))
 
-        rows.append(
-            {
-                "pitcher": pitcher_name,
-                "base_pc": base_pc,
-                "outs": o.mean(),
-                "IP": o.mean() / 3,
-                "BF": bf.mean(),
-                "PC": pc.mean(),
-                "P/BF": pc.mean() / bf.mean(),
-                "flag": "" if abs(o.mean() - TARGET_OUTS) <= 1.0 else "***",
-            }
-        )
+            po, pbf, ppc = map(np.array, (po, pbf, ppc))
+            mean_outs = po.mean()
+            suggested = scale * TARGET_OUTS / mean_outs
 
-    tbl = pd.DataFrame(rows).sort_values("outs", ascending=False)
-    pd.set_option("display.float_format", lambda x: f"{x:.2f}")
-    print("\n=== per-starter workload ===")
-    print(tbl.to_string(index=False))
+            # actual-PC residuals (the honest check)
+            if sim_vs_actual:
+                sa = np.array(sim_vs_actual)
+                pc_bias = (sa[:, 0] - sa[:, 1]).mean()  # + = sim over-throws
+                pc_mae = np.abs(sa[:, 0] - sa[:, 1]).mean()
+                n_actual = len(sa)
+            else:
+                pc_bias = pc_mae = np.nan
+                n_actual = 0
 
-    po, pbf, ppc = map(np.array, (pooled_outs, pooled_bf, pooled_pc))
-    print("\n=== pooled vs real targets ===")
-    print(f"{'metric':<6}{'sim mean':>10}{'sim std':>9}{'target':>9}{'delta':>9}")
-    for name, arr, tgt in [
-        ("outs", po, TARGET_OUTS),
-        ("BF", pbf, TARGET_BF),
-        ("PC", ppc, TARGET_PC),
-    ]:
-        print(
-            f"{name:<6}{arr.mean():>10.2f}{arr.std():>9.2f}{tgt:>9.2f}{arr.mean()-tgt:>+9.2f}"
-        )
-    print(f"{'P/BF':<6}{ppc.mean()/pbf.mean():>10.2f}{'':>9}{3.90:>9.2f}")
-    print(f"{'OBPa':<6}{1 - po.mean()/pbf.mean():>10.3f}{'':>9}{0.315:>9.3f}")
+            results.append(
+                dict(
+                    scale=scale,
+                    margin=margin,
+                    outs=mean_outs,
+                    BF=pbf.mean(),
+                    PC=ppc.mean(),
+                    obpa=1 - po.mean() / pbf.mean(),
+                    pc_bias=pc_bias,
+                    pc_mae=pc_mae,
+                    n_actual=n_actual,
+                    outs_err=abs(mean_outs - TARGET_OUTS),
+                    suggested=suggested,
+                )
+            )
 
-    suggested = leash_scale * TARGET_OUTS / po.mean()
+    res = pd.DataFrame(results).sort_values("outs_err")
+    pd.set_option("display.float_format", lambda x: f"{x:.3f}")
     print(
-        f"\ncurrent LEASH_SCALE = {leash_scale:.3f}"
-        f"  ->  suggested = {suggested:.3f}  (centers mean outs on {TARGET_OUTS})"
+        "\n=== leash_scale x margin sweep "
+        f"(target outs {TARGET_OUTS}, BF {TARGET_BF}, PC {TARGET_PC}) ==="
     )
-    return tbl, suggested
+    print("  sorted by |outs - target|; pc_bias>0 means sim throws MORE than reality")
+    print(res.to_string(index=False))
+
+    best = res.iloc[0]
+    print(
+        f"\nbest by outs: scale={best['scale']:.3f}, margin={best['margin']:.0f}"
+        f"  ->  outs {best['outs']:.2f}, PC bias {best['pc_bias']:+.1f}, "
+        f"MAE {best['pc_mae']:.1f} over {int(best['n_actual'])} real starts"
+    )
+    return res
+
+
+def _actual_pc_for(pitcher_id, date):
+    """Actual pitches thrown by this pitcher on this date, from the outing log."""
+    logs = pd.read_csv("./data/pitcher_outing_logs.csv")
+    hit = logs[
+        (logs["mlbID"] == pitcher_id) & (logs["date"] == int(date)) & (logs["GS"] == 1)
+    ]
+    if hit.empty:
+        return None
+    return float(hit["pitch_count"].values[0])
 
 
 def build_day_context(curr_date: str):
@@ -1491,9 +1580,9 @@ def build_day_context(curr_date: str):
     hook and the league baselines for the combines. Rebuilt per day so a
     backtest uses only information available on that date."""
     # 1) Outing-length shape for the hook (left-skewed, ~CV 0.14)
-    logs = _load_csv("./data/pitcher_outing_logs.csv")
+    logs = pd.read_csv("./data/pitcher_outing_logs.csv")
     valid = logs[logs["date"] < int(curr_date)]
-    st = valid[valid["is_start"] == 1]
+    st = valid[valid["GS"] == 1]
     g = st.groupby("mlbID")["pitch_count"]
     keep = g.count()[g.count() >= 8].index
     outing_ratios = np.concatenate(
@@ -1585,7 +1674,7 @@ def output_slate(date: str):
         plot_p=False,  # plot pitcher distributions
         plot_b=False,  # plot batter distributions
         odds=True,  # compare odds
-        odds_write=False,  # commit bets to the props file
+        odds_write=True,  # commit bets to the props file
     )
     # TODO Get the expected variance of a monte carlo
 
@@ -1597,12 +1686,13 @@ if __name__ == "__main__":
     # PHASE 1 — TODAY (live): print suggested bets, write real odds.
     #           Not graded (no results yet), not part of the backtest.
     # ============================================================
-    # output_slate(today)
+    # calibrate_workload(20)
+    output_slate(today)
 
     # ============================================================
     # PHASE 2 — grade yesterday into the master results file.
     # ============================================================
-    against_market_results()  # write_master=True, verbose=True
+    # against_market_results()  # write_master=True, verbose=True
 
     # ============================================================
     # PHASE 3 — BACKTEST prior days: silent, no writes, accumulate.
