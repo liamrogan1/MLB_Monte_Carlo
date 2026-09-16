@@ -119,72 +119,75 @@ def match_player(
 
 
 def add_prop_results():
-    yesterday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    yday = (pd.to_datetime("today") - pd.Timedelta(days=1)).strftime("%Y%m%d")
 
-    if not Path(f"./data/odds/{yday}_props.csv").is_file():
-        print("No props gathered yesterday")
-        return
-
-    odds_df = pd.read_csv(f"./data/odds/{yday}_props.csv")
-
-    if "result" not in odds_df.columns:
-        odds_df["result"] = np.nan
-    elif odds_df["result"].notna().any():
-        print(f"Odds have already been graded for {yesterday}")
-        return
-
-    yesterday_results = pybaseball.pitching_stats_range(yesterday, yesterday)
-    yesterday_results["mlbID"] = pd.to_numeric(
-        yesterday_results["mlbID"], errors="coerce"
-    )
-
-    day_totals = (
-        yesterday_results.dropna(subset=["mlbID"])
-        .groupby(["mlbID", "Name"], as_index=False)[["SO", "BB"]]
-        .sum()
-    )
-    day_totals["mlbID"] = day_totals["mlbID"].astype(int)
-
-    print(f"Grading props for {yday}")
-
-    for prop_type in ["pitcher strikeouts", "pitcher walks"]:
-        subset = odds_df[odds_df["type"] == prop_type]
-        if subset.empty:
+    for day in range(1, 8):
+        cday = (pd.to_datetime("today") - pd.Timedelta(days=day)).strftime("%Y-%m-%d")
+        curr = (pd.to_datetime("today") - pd.Timedelta(days=day)).strftime("%Y%m%d")
+        if not Path(f"./data/odds/{curr}_props.csv").is_file():
+            print(f"No props gathered on {curr}")
             continue
-        stat_col = "SO" if prop_type == "pitcher strikeouts" else "BB"
 
-        print(f"\nGrading {prop_type}:")
-        for player_name in subset["player"].unique():
-            mlb_id, matched_name, score = match_player(player_name, day_totals)
-            row_idx = subset[subset["player"] == player_name].index
+        odds_df = pd.read_csv(f"./data/odds/{curr}_props.csv")
 
-            if mlb_id is None:
-                odds_df.loc[row_idx, "result"] = np.nan
-                closest = (
-                    f"closest: {matched_name} ({score})"
-                    if matched_name
-                    else "no candidates"
-                )
-                print(f"  {player_name:<25} -> NO MATCH ({closest}) -- left as NaN")
+        if "result" not in odds_df.columns:
+            odds_df["result"] = np.nan
+        elif odds_df["result"].notna().any():
+            print(f"Odds have already been graded for {cday}")
+            continue
+
+        yesterday_results = pybaseball.pitching_stats_range(cday, cday)
+        yesterday_results["mlbID"] = pd.to_numeric(
+            yesterday_results["mlbID"], errors="coerce"
+        )
+
+        day_totals = (
+            yesterday_results.dropna(subset=["mlbID"])
+            .groupby(["mlbID", "Name"], as_index=False)[["SO", "BB"]]
+            .sum()
+        )
+        day_totals["mlbID"] = day_totals["mlbID"].astype(int)
+
+        print(f"Grading props for {curr}")
+
+        for prop_type in ["pitcher strikeouts", "pitcher walks"]:
+            subset = odds_df[odds_df["type"] == prop_type]
+            if subset.empty:
                 continue
+            stat_col = "SO" if prop_type == "pitcher strikeouts" else "BB"
 
-            result_rows = day_totals.loc[day_totals["mlbID"] == mlb_id, stat_col]
-            if result_rows.empty:
-                odds_df.loc[row_idx, "result"] = np.nan
+            print(f"\nGrading {prop_type}:")
+            for player_name in subset["player"].unique():
+                mlb_id, matched_name, score = match_player(player_name, day_totals)
+                row_idx = subset[subset["player"] == player_name].index
+
+                if mlb_id is None:
+                    odds_df.loc[row_idx, "result"] = np.nan
+                    closest = (
+                        f"closest: {matched_name} ({score})"
+                        if matched_name
+                        else "no candidates"
+                    )
+                    print(f"  {player_name:<25} -> NO MATCH ({closest}) -- left as NaN")
+                    continue
+
+                result_rows = day_totals.loc[day_totals["mlbID"] == mlb_id, stat_col]
+                if result_rows.empty:
+                    odds_df.loc[row_idx, "result"] = np.nan
+                    print(
+                        f"  {player_name:<25} -> id {mlb_id} not in results -- left as NaN"
+                    )
+                    continue
+
+                result = result_rows.iloc[0]
+                odds_df.loc[row_idx, "result"] = result
+                flag = "" if score == 100 else f"  [fuzzy {score}]"
                 print(
-                    f"  {player_name:<25} -> id {mlb_id} not in results -- left as NaN"
+                    f"  {player_name:<25} -> {matched_name:<25} {result:>3.0f} {flag}"
                 )
-                continue
 
-            result = result_rows.iloc[0]
-            odds_df.loc[row_idx, "result"] = result
-            flag = "" if score == 100 else f"  [fuzzy {score}]"
-            print(f"  {player_name:<25} -> {matched_name:<25} {result:>3.0f} {flag}")
-
-    odds_df.to_csv(f"./data/odds/{yday}_props.csv", index=False)
-    graded = odds_df["result"].notna().sum()
-    print(f"\nSaved: {graded}/{len(odds_df)} lines graded.")
+        odds_df.to_csv(f"./data/odds/{curr}_props.csv", index=False)
+        graded = odds_df["result"].notna().sum()
+        print(f"\nSaved: {graded}/{len(odds_df)} lines graded.")
 
 
 def save_relevant_data(year, date=pd.to_datetime("today").strftime("%Y%m%d")):

@@ -1,12 +1,9 @@
-from collections import defaultdict
 from functools import lru_cache
 import math
 import os
-import pickle
-from scipy.stats import gaussian_kde, poisson
+import time
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from fuzzywuzzy import fuzz
 from import_odds import latest_snapshot
 import display_outcomes
@@ -55,6 +52,24 @@ LEAGUE_HIT_SHARES = np.array(
 @lru_cache(maxsize=None)
 def _load_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
+
+
+def _to_csv(df: pd.DataFrame, path: str):
+    base = 10  # 10 seconds to start
+    num_retries = 3  # Limit of number of retries
+    c = 0
+
+    while c < num_retries:
+        try:
+            c += 1
+            df.to_csv(path, index=False)
+            break
+
+        except Exception:
+            print(f"User is inside the file {path}, cannot write")
+            time.sleep(base**c)
+    if c >= num_retries:
+        print(f"Could not write to {path}")
 
 
 # Odds-ratio (log5). Use ONLY for bounded probabilities: K%, BB%, BIP%.
@@ -652,9 +667,17 @@ def compare_odds_pitcher(
     ].copy()
 
     pitcher_odds["name_match"] = pitcher_odds["player"].apply(
-        lambda x: fuzz.ratio(x, pitcher_name)
+        lambda x: fuzz.token_sort_ratio(x, pitcher_name)
     )
-    pitcher_odds = pitcher_odds[pitcher_odds["name_match"] > 50].copy()
+
+    NAME_MATCH_FLOOR = 60  # below this, assume the pitcher isn't in the file at all
+    if pitcher_odds.empty or pitcher_odds["name_match"].max() < NAME_MATCH_FLOOR:
+        pitcher_odds = pitcher_odds.iloc[
+            0:0
+        ].copy()  # no acceptable match -> keep nothing
+    else:
+        best_name = pitcher_odds.loc[pitcher_odds["name_match"].idxmax(), "player"]
+        pitcher_odds = pitcher_odds[pitcher_odds["player"] == best_name].copy()
 
     for idx, row in pitcher_odds.iterrows():
         point = row["point"]
@@ -696,7 +719,7 @@ def compare_odds_pitcher(
             )
 
     if write:
-        odds_df.to_csv(path, index=False)
+        _to_csv(odds_df, path)
 
     out = odds_df.loc[pitcher_odds.index].copy()
     out["pitcher"] = pitcher_name
@@ -719,6 +742,9 @@ def monte_carlo_outs(
     odds_write=False,
 ):
     rng = np.random.default_rng(seed)
+    if not os.path.exists(f"./data/lineups/{date}_lineup.csv"):
+        return
+
     lineups_data = _load_csv(f"./data/lineups/{date}_lineup.csv")
     matchup_file = pd.DataFrame()
     ml_prob = {}
@@ -789,7 +815,7 @@ def monte_carlo_outs(
         LEASH_SCALE = 1.2
 
         # ---- v1 out-based simulation (replaces the old pitch-budget starter + bullpen loops) ----
-        for n in tqdm(range(n_sims)):
+        for n in range(n_sims):
             target = (
                 base_pc * rng.choice(outing_ratios) * LEASH_SCALE
             )  # calibrated left-skew hook
@@ -845,7 +871,8 @@ def monte_carlo_outs(
         # Print mean and median expected bases for each hitter
         cum_mean = 0
         cum_median = 0
-        print("=" * 70)
+        if printing:
+            print("=" * 70)
         for hitter in hitter_expected_bases:
             expected_bases_list = np.array(hitter_expected_bases[hitter])
             expected_hrs_list = np.array(hitter_expected_hrs[hitter])
@@ -932,7 +959,7 @@ def monte_carlo_outs(
                 batting_team,
                 date,
             )
-    matchup_file.to_csv(f"./data/todays_matchups.csv", index=False)
+    _to_csv(matchup_file, f"./data/todays_matchups.csv")
     return sim_rows
 
 
@@ -1622,19 +1649,23 @@ def backtest(num_days):
     all_sim_rows = []  # flat list of per-pitcher diff frames
     pnl_rows = []  # one P&L record per backtested day
 
-    for day in tqdm(
-        range(1, num_days + 1)
+    for day in range(
+        1, num_days + 1
     ):  # yesterday .. 10 days ago (today handled in phase 1)
-        curr_date = (pd.to_datetime("today") - pd.Timedelta(days=num_days)).strftime(
+        curr_date = (pd.to_datetime("today") - pd.Timedelta(days=day)).strftime(
             "%Y%m%d"
         )
+        if not os.path.exists(f"./data/odds/{curr_date}_props.csv"):
+            print(f"No odds data for {curr_date}")
+            continue
+        print(curr_date)
         outing_ratios, league = build_day_context(curr_date)
 
         day_rows = monte_carlo_outs(
             date=curr_date,
             outing_ratios=outing_ratios,
             league=league,
-            n_sims=10000,
+            n_sims=3500,
             printing=False,
             plot_p=False,
             plot_b=False,
@@ -1674,7 +1705,7 @@ def output_slate(date: str):
         plot_p=False,  # plot pitcher distributions
         plot_b=False,  # plot batter distributions
         odds=True,  # compare odds
-        odds_write=True,  # commit bets to the props file
+        odds_write=False,  # commit bets to the props file
     )
     # TODO Get the expected variance of a monte carlo
 
@@ -1692,9 +1723,9 @@ if __name__ == "__main__":
     # ============================================================
     # PHASE 2 — grade yesterday into the master results file.
     # ============================================================
-    # against_market_results()  # write_master=True, verbose=True
+    against_market_results()  # write_master=True, verbose=True
 
     # ============================================================
     # PHASE 3 — BACKTEST prior days: silent, no writes, accumulate.
     # ============================================================
-    # backtest(num_days=50)
+    # backtest(num_days=100)
