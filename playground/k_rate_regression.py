@@ -774,31 +774,32 @@ def oof_logloss(data, feats, y, groups, n_splits=5):
     return log_loss(y, oof), oof
 
 
-def forward_select(data, candidates, y, groups, base=(), tol=1e-4, n_splits=5):
+def forward_select(data, candidates, y, groups, base=(), n_splits=5):
     from sklearn.metrics import log_loss
 
     selected = list(base)
     remaining = [f for f in candidates if f not in selected]
-    best = (
+    best0 = (
         oof_logloss(data, selected, y, groups, n_splits)[0]
         if selected
         else log_loss(y, np.full(len(y), y.mean()))
     )
-    print(f"start: {selected}  logloss {best:.5f}")
+    path = [(list(selected), best0)]  # (feature set, score) after each step
+    print(f"start: {selected}  logloss {best0:.5f}")
+
     while remaining:
         ll, f = min(
             (oof_logloss(data, selected + [c], y, groups, n_splits)[0], c)
             for c in remaining
         )
-        if best - ll > tol:
-            selected.append(f)
-            remaining.remove(f)
-            best = ll
-            print(f"  + {f:<32} logloss {ll:.5f}")
-        else:
-            print(f"  stop (best add {f} -> {ll:.5f}, gain < {tol})")
-            break
-    return selected
+        selected.append(f)  # always consume the winner
+        remaining.remove(f)
+        path.append((list(selected), ll))
+        print(f"  + {f:<32} logloss {ll:.5f}")
+
+    best_set, best_ll = min(path, key=lambda p: p[1])  # pick the low point
+    print(f"best: {len(best_set)} feats  logloss {best_ll:.5f}")
+    return best_set
 
 
 def add_league_k(df, target="strikeout", season_col="season"):
@@ -825,7 +826,15 @@ def add_log5_k(
     return df
 
 
-def train_logistic(df):
+def train_ks_logistic(df):
+    """
+    Calculates a few additional fields like pitcher abd batter strikeout talent as wll as their log5 combination.
+    Then from a list of candidates, features are forward selected using log loss. Finally these features are tested and total log loss,
+    K% RMSE (for game), and K% RMSE weighted by batters faced are calculated.
+
+    df: Has every pre-game feature available for both the batter and the pitcher at the given at bat
+    """
+
     import numpy as np
     from sklearn.metrics import mean_squared_error
 
@@ -854,21 +863,39 @@ def train_logistic(df):
         "bat_avg_whiff_percent_career",
         "bat_avg_first_pitch_strike_rate_career",
         "bat_avg_avg_swing_length_career",
+        "bat_avg_chase_percent_szn",
+        "bat_avg_whiff_percent_szn",
+        "bat_avg_first_pitch_strike_rate_szn",
+        "bat_avg_avg_swing_length_szn",
         "pit_avg_chase_percent_career",
         "pit_avg_whiff_percent_career",
+        "pit_avg_chase_percent_szn",
+        "pit_avg_whiff_percent_szn",
+        "pit_avg_avg_velocity_career",
         "pit_avg_avg_velocity_l5",
         "pit_avg_first_pitch_strike_rate_career",
+        "pit_avg_first_pitch_strike_rate_l5",
         "pit_avg_max_velocity_career",
+        "pit_avg_max_velocity_l5",
         "tto",
         "pit_avg_release_consistency_szn",
         "pit_avg_velo_spread_szn",
         "pit_avg_movement_spread_szn",
+        "pit_avg_movement_spread_l5",
         "pit_put_away_pct_career",
+        "pit_put_away_pct_l5",
         "pit_put_away_pct_breaking_career",
         "pit_ts_usage_breaking_szn",
         "pit_arsenal_entropy_szn",
     ]
-    keep = ["game_pk", "pitcher_id", "game_date", "strikeout", *candidates]
+    keep = [
+        "game_pk",
+        "pitcher_id",
+        "game_date",
+        "pitcher_name",
+        "strikeout",
+        *candidates,
+    ]
     data = df[keep].dropna().sort_values("game_date").reset_index(drop=True)
     y = data["strikeout"].to_numpy()
     groups = data["game_pk"].to_numpy()
@@ -885,10 +912,164 @@ def train_logistic(df):
     ll, oof = oof_logloss(data, chosen, y, groups)
     data["p_k"] = oof
     print(f"final OOF logloss {ll:.5f}")
-    gm = data.groupby(["game_pk", "pitcher_id"]).agg(
-        pred_k=("p_k", "mean"), actual_k=("strikeout", "mean")
+    gm = (
+        data.groupby(["game_pk", "pitcher_id"])
+        .agg(
+            pred_k=("p_k", "mean"),
+            actual_k=("strikeout", "mean"),
+            pitcher_name=("pitcher_name", "first"),
+            game_date=("game_date", "first"),
+            bf=("strikeout", "size"),
+            actual_total=("strikeout", "sum"),
+        )
+        .reset_index()
     )
+    gm["pred_total"] = gm["pred_k"] * gm["bf"]
+
+    gm = gm.sort_values(["pitcher_id", "game_date"])
+    g = gm.groupby("pitcher_id")
+    prior_k = g["actual_total"].transform(lambda s: s.shift(1).expanding().sum())
+    prior_bf = g["bf"].transform(lambda s: s.shift(1).expanding().sum())
+    gm["prev_kp"] = prior_k / prior_bf
+
+    # directional hit: pred and actual on the same side of his baseline
+    pred_up = gm["pred_k"] > gm["prev_kp"]
+    act_up = gm["actual_k"] > gm["prev_kp"]
+    gm["direction_hit"] = (pred_up == act_up).astype(int)
+    gm.loc[gm["prev_kp"].isna(), "direction_hit"] = np.nan  # first outing: no baseline
+
     print(f"game K% RMSE {np.sqrt(mean_squared_error(gm.actual_k, gm.pred_k)):.4f}")
+    print(
+        f"game weighted K% RMSE {np.sqrt(mean_squared_error(gm.actual_k, gm.pred_k, sample_weight=gm.bf))}"
+    )
+    print(
+        f"Total pred Ks {gm.pred_total.sum():.0f} vs actual Ks {gm.actual_total.sum()}"
+    )
+    print(f"direction accuracy {gm['direction_hit'].mean():.3f}")
+    return chosen, data, gm
+
+
+# TODO Configure
+def train_bbs_logistic(df):
+    """
+    Calculates a few additional fields like pitcher abd batter strikeout talent as wll as their log5 combination.
+    Then from a list of candidates, features are forward selected using log loss. Finally these features are tested and total log loss,
+    BB% RMSE (for game), and BB% RMSE weighted by batters faced are calculated.
+
+    df: Has every pre-game feature available for both the batter and the pitcher at the given at bat
+    """
+
+    import numpy as np
+    from sklearn.metrics import mean_squared_error
+
+    df = df[df["is_pa"] == 1].copy()
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    df = add_league_k(df)
+    df["pit_talent_k"] = talent_k(
+        df,
+        "pit_k_szn_todate",
+        "pit_bf_szn_todate",
+        "pit_avg_k_percent_career",
+        "league_k",
+    )
+    df["bat_talent_k"] = talent_k(
+        df,
+        "bat_k_szn_todate",
+        "bat_pa_szn_todate",
+        "bat_avg_k_percent_career",
+        "league_k",
+    )
+    df = add_log5_k(df, pit_col="pit_talent_k", bat_col="bat_talent_k")
+
+    candidates = [
+        "log5_k",
+        "bat_avg_chase_percent_career",
+        "bat_avg_whiff_percent_career",
+        "bat_avg_first_pitch_strike_rate_career",
+        "bat_avg_avg_swing_length_career",
+        "bat_avg_chase_percent_szn",
+        "bat_avg_whiff_percent_szn",
+        "bat_avg_first_pitch_strike_rate_szn",
+        "bat_avg_avg_swing_length_szn",
+        "pit_avg_chase_percent_career",
+        "pit_avg_whiff_percent_career",
+        "pit_avg_chase_percent_szn",
+        "pit_avg_whiff_percent_szn",
+        "pit_avg_avg_velocity_career",
+        "pit_avg_avg_velocity_l5",
+        "pit_avg_first_pitch_strike_rate_career",
+        "pit_avg_first_pitch_strike_rate_l5",
+        "pit_avg_max_velocity_career",
+        "pit_avg_max_velocity_l5",
+        "tto",
+        "pit_avg_release_consistency_szn",
+        "pit_avg_velo_spread_szn",
+        "pit_avg_movement_spread_szn",
+        "pit_avg_movement_spread_l5",
+        "pit_put_away_pct_career",
+        "pit_put_away_pct_l5",
+        "pit_put_away_pct_breaking_career",
+        "pit_ts_usage_breaking_szn",
+        "pit_arsenal_entropy_szn",
+    ]
+    keep = [
+        "game_pk",
+        "pitcher_id",
+        "game_date",
+        "pitcher_name",
+        "strikeout",
+        *candidates,
+    ]
+    data = df[keep].dropna().sort_values("game_date").reset_index(drop=True)
+    y = data["strikeout"].to_numpy()
+    groups = data["game_pk"].to_numpy()
+
+    chosen = forward_select(
+        data,
+        candidates,
+        y,
+        groups,
+        base=["log5_k", "pit_avg_whiff_percent_career", "pit_avg_movement_spread_szn"],
+    )
+    print("selected:", chosen)
+
+    ll, oof = oof_logloss(data, chosen, y, groups)
+    data["p_k"] = oof
+    print(f"final OOF logloss {ll:.5f}")
+    gm = (
+        data.groupby(["game_pk", "pitcher_id"])
+        .agg(
+            pred_k=("p_k", "mean"),
+            actual_k=("strikeout", "mean"),
+            pitcher_name=("pitcher_name", "first"),
+            game_date=("game_date", "first"),
+            bf=("strikeout", "size"),
+            actual_total=("strikeout", "sum"),
+        )
+        .reset_index()
+    )
+    gm["pred_total"] = gm["pred_k"] * gm["bf"]
+
+    gm = gm.sort_values(["pitcher_id", "game_date"])
+    g = gm.groupby("pitcher_id")
+    prior_k = g["actual_total"].transform(lambda s: s.shift(1).expanding().sum())
+    prior_bf = g["bf"].transform(lambda s: s.shift(1).expanding().sum())
+    gm["prev_kp"] = prior_k / prior_bf
+
+    # directional hit: pred and actual on the same side of his baseline
+    pred_up = gm["pred_k"] > gm["prev_kp"]
+    act_up = gm["actual_k"] > gm["prev_kp"]
+    gm["direction_hit"] = (pred_up == act_up).astype(int)
+    gm.loc[gm["prev_kp"].isna(), "direction_hit"] = np.nan  # first outing: no baseline
+
+    print(f"game K% RMSE {np.sqrt(mean_squared_error(gm.actual_k, gm.pred_k)):.4f}")
+    print(
+        f"game weighted K% RMSE {np.sqrt(mean_squared_error(gm.actual_k, gm.pred_k, sample_weight=gm.bf))}"
+    )
+    print(
+        f"Total pred Ks {gm.pred_total.sum():.0f} vs actual Ks {gm.actual_total.sum()}"
+    )
+    print(f"direction accuracy {gm['direction_hit'].mean():.3f}")
     return chosen, data, gm
 
 
@@ -904,8 +1085,8 @@ def pregame_feats(log, entity_col, prefix):
 
 
 if __name__ == "__main__":
-    # for year in range(2021, 2027):
-    #     pull_year(year)
+    for year in range(2021, 2027):
+        pull_year(year)
 
     # duckdb.sql("""DESCRIBE 'data/training_data/statcast_2025.parquet'""").show(
     #     max_rows=120
@@ -915,7 +1096,7 @@ if __name__ == "__main__":
     #     """).show()
     dfs = []
     for year in range(2024, 2027):
-        dfs.append(_read_parquet(f"./data/training_data/statcast_{year}.parquet"))
+        dfs.append(_read_parquet(f"../data/training_data/statcast_{year}.parquet"))
     raw = pd.concat(dfs, ignore_index=True)
     df = build_features(raw)
     # pitcher_outings = build_outing_level(df)
@@ -949,8 +1130,8 @@ if __name__ == "__main__":
     # print("unmatched batter rows:", m2["bat_avg_k_percent_szn"].isna().mean())
     # print("unmatched pitcher rows:", m2["pit_avg_k_percent_szn"].isna().mean())
 
-    chosen, data, games = train_logistic(m2)
+    chosen, data, games = train_ks_logistic(m2)
+    games.to_csv("./playground/log_k_test_results.csv")
 
-    print(chosen)
-    print(data.shape)
-    games.to_csv("./log_test_results.csv")
+    # chosen, data, games = train_bbs_logistic(m2)
+    # games.to_csv("./playground/log_bb_test_results.csv")

@@ -727,6 +727,7 @@ def compare_odds_pitcher(
 
 
 # TODO
+# Create batter and pitcher objects
 # 3. Add in platoon splits
 # 4. Add in weather
 def monte_carlo_outs(
@@ -741,7 +742,7 @@ def monte_carlo_outs(
     odds=False,
     odds_write=False,
 ):
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng()
     if not os.path.exists(f"./data/lineups/{date}_lineup.csv"):
         return
 
@@ -777,7 +778,6 @@ def monte_carlo_outs(
             )
             for j in range(9)
         ]
-        base_pc, std = get_pitcher_pc_distribution(pitcher_id, date)
 
         matchup_file = pd.concat([matchup_file, df], ignore_index=True)
 
@@ -795,6 +795,9 @@ def monte_carlo_outs(
         if printing:
             print(f"{pitcher_name} vs {batting_team} lineup")
             print(arsenal_print)
+
+        base_pc, std = get_pitcher_pc_distribution(pitcher_id, date)
+        # TODO Add in an automatically detected flag when the last game pc << projected pc
 
         # Create a dictionary with batter name and expected total bases, strikeouts, and walks
         hitter_expected_bases = {}
@@ -1691,22 +1694,36 @@ def backtest(num_days):
         summarize_pnl(pnl_rows)
 
 
-def output_slate(date: str):
+## TODO use kwargs
+def output_slate(date: str, write=True):
     print("=" * 70)
     print(f"TODAY {today} — suggested bets")
     print("=" * 70)
     outing_ratios, league = build_day_context(today)
-    monte_carlo_outs(
-        date=date,  # date of simulation
-        outing_ratios=outing_ratios,  # starting pitcher's outing skew
-        league=league,  # league averages for fall-back
-        n_sims=10000,  # number of sims
-        printing=True,  # print out expected statistics
-        plot_p=False,  # plot pitcher distributions
-        plot_b=False,  # plot batter distributions
-        odds=True,  # compare odds
-        odds_write=False,  # commit bets to the props file
-    )
+    if write:
+        monte_carlo_outs(
+            date=date,  # date of simulation
+            outing_ratios=outing_ratios,  # starting pitcher's outing skew
+            league=league,  # league averages for fall-back
+            n_sims=10000,  # number of sims
+            printing=True,  # print out expected statistics
+            plot_p=False,  # plot pitcher distributions
+            plot_b=False,  # plot batter distributions
+            odds=True,  # compare odds
+            odds_write=True,  # commit bets to the props file
+        )
+    else:
+        monte_carlo_outs(
+            date=date,  # date of simulation
+            outing_ratios=outing_ratios,  # starting pitcher's outing skew
+            league=league,  # league averages for fall-back
+            n_sims=10000,  # number of sims
+            printing=True,  # print out expected statistics
+            plot_p=False,  # plot pitcher distributions
+            plot_b=False,  # plot batter distributions
+            odds=True,  # compare odds
+            odds_write=False,  # commit bets to the props file
+        )
     # TODO Get the expected variance of a monte carlo
 
 
@@ -1718,7 +1735,10 @@ if __name__ == "__main__":
     #           Not graded (no results yet), not part of the backtest.
     # ============================================================
     # calibrate_workload(20)
-    output_slate(today)
+    output_slate(
+        today,
+        write=True,
+    )
 
     # ============================================================
     # PHASE 2 — grade yesterday into the master results file.
